@@ -27,7 +27,7 @@ Dev install: clone the repo and symlink it into `~/.config/omarchy/plugins/crooy
 ## Usage
 
 - Left click the bar icon: toggle the panel; right click: lock.
-- If a keybind is configured (e.g. `SUPER+B` → `omarchy-shell ipc call omabitwarden toggle`), use it.
+- If a keybind is configured (e.g. `SUPER+B` → `omarchy-shell omabitwarden toggle`), use it.
 
 ## IPC
 
@@ -39,4 +39,4 @@ Target `omabitwarden`:
 | `lock`    | Lock the vault             |
 | `status`  | Prints `locked`/`unlocked` |
 
-Example: `omarchy-shell ipc call omabitwarden toggle`
+Example: `omarchy-shell omabitwarden toggle`
