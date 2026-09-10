@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "crooy.omabitwarden",
+  "name": "Bitwarden",
+  "version": "1.0.0",
+  "author": "Ronald Crooy",
+  "description": "Bitwarden vault: bar lock icon toggling a keyboard-first unlock/search/copy panel over bw serve",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Bitwarden",
+    "description": "Bar lock icon toggling a keyboard-first vault panel (unlock, search, copy secrets)",
+    "category": "Security",
+    "allowMultiple": false
+  }
+}
