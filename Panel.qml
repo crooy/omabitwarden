@@ -27,6 +27,10 @@ import "totp.js" as Totp
 Panel {
   id: root
   moduleName: "crooy.omabitwarden"
+
+  // Orphaned bw serve from a previous shell instance dies at plugin mount:
+  // it holds the vault open without any key (see checkStaleServe).
+  Component.onCompleted: root.checkStaleServe()
   ipcTarget: "omabitwarden"
   manageIpc: false // IpcHandler lives in BarWidget.qml
 
@@ -39,7 +43,6 @@ Panel {
 
   // ---- Vault state (ported verbatim from the standalone shell)
   property bool locked: true
-  property bool attached: false // serve we did NOT spawn (pre-running); never killed by us
   property string sessionKey: "" // memory only, never argv/URL/disk
   property var items: []
   property string query: ""
@@ -67,7 +70,7 @@ Panel {
     if (root.locked) {
       pass.clear();
       passError.text = "";
-      root.checkAttach();
+      root.checkStaleServe();
     }
     root.controller.show();
     idleTimer.restart();
@@ -216,28 +219,25 @@ Panel {
     });
   }
 
-  function checkAttach() {
-    // A serve already answering unlocked on :8087 (user-started, or panel
-    // reloaded mid-session): adopt it. We never kill a serve we didn't spawn.
+  function checkStaleServe() {
+    // The panel owns :8087. Any bw serve answering while we are locked is
+    // stale (orphaned by a shell restart, or foreign) and still holds the
+    // vault open without any key — kill it, then show the unlock card.
     root.api("/status", function (data, err) {
-      if (err) return; // no serve -> normal unlock path
-      if (data && data.template && data.template.status === "unlocked") {
-        root.attached = true;
-        root.openVault();
-      } else {
-        showToast("another bw serve holds :8087 (locked) — kill it first");
-      }
+      if (err) return; // port free -> normal unlock path
+      showToast("stale bw serve on :8087 killed — unlock to continue");
+      portKillProc.running = true;
     });
   }
 
   function lockVault(hide) {
     root.locked = true;
-    root.attached = false;
     root.items = [];
     root.query = "";
     root.expandedIndex = -1;
     root.sessionKey = ""; // key gone with the serve child
     serveProc.running = false; // SIGTERM; managed child must never outlive the key
+    portKillProc.running = true; // orphans (shell restarted under us) die by port
     root.busy = false;
     if (hide) root.close();
     else { pass.clear(); pass.forceActiveFocus(); }
@@ -266,13 +266,19 @@ Panel {
     id: serveProc
     command: ["/usr/bin/bw", "serve", "--hostname", "127.0.0.1", "--port", "8087", "--disable-origin-protection"]
     onExited: {
-      if (!root.locked && !root.attached) {
+      if (!root.locked) {
         root.showToast("bw serve exited — locking");
         root.lockVault(false);
       }
     }
   }
 
+
+  Process {
+    id: portKillProc
+    // fuser (port match, not cmdline) so this never pkills its own shell.
+    command: ["/bin/sh", "-c", "fuser -k 8087/tcp >/dev/null 2>&1 || true"]
+  }
   Process {
     id: genProc
     command: ["/bin/sh", "-c", "tr -dc \"$A\" < /dev/urandom | head -c \"$N\""]

@@ -5,7 +5,7 @@ Bitwarden vault panel as an Omarchy shell plugin (kind: bar-widget): a lock icon
 ## Features
 
 - Unlock with the master password through the official `bw` CLI (`bw unlock --passwordenv`, master password never on argv).
-- Spawns a local `bw serve` on `127.0.0.1:8087` for fast reads; attaches to (and never kills) a pre-existing serve.
+- Owns port `127.0.0.1:8087`: spawns a local `bw serve` after unlock; on lock (and at startup, if one is left over) any `bw serve` on that port is killed — a leftover serve would keep the vault open without any key.
 - Search vault items by name or username; copy `username`, `password`, or TOTP — TOTP codes are computed locally in pure JS (RFC 6238), no bw subprocess per copy.
 - Password and passphrase generator, straight to the clipboard.
 - Clipboard secrets go via `wl-copy --sensitive` with a guarded 45s auto-clear.
