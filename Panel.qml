@@ -151,6 +151,7 @@ Panel {
   // real entry: submit password from the field
   function submitUnlock() {
     root.revealPw = false;
+    const pw = pass.text;
     pass.text = "";
     root.busy = true;
     passError.text = "unlocking — deriving key…";
