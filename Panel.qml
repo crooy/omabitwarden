@@ -52,6 +52,7 @@ Panel {
   property int statusAttempts: 0
   property bool toastCloses: false // only copy-toasts close the panel
   property bool busy: false // unlock in flight: bar + status message
+  property bool revealPw: false // master password shown in cleartext
 
   readonly property string apiBase: "http://127.0.0.1:8087"
 
@@ -149,7 +150,7 @@ Panel {
 
   // real entry: submit password from the field
   function submitUnlock() {
-    const pw = pass.text;
+    root.revealPw = false;
     pass.text = "";
     root.busy = true;
     passError.text = "unlocking — deriving key…";
@@ -232,6 +233,7 @@ Panel {
 
   function lockVault(hide) {
     root.locked = true;
+    root.revealPw = false;
     root.items = [];
     root.query = "";
     root.expandedIndex = -1;
@@ -323,7 +325,7 @@ Panel {
     // The standalone panel was a dead-center modal over a fullscreen
     // PanelWindow; the popout equivalent is the kit's centerOnBar placement:
     // card centered on the bar axis, below it. No new window type invented.
-    centerOnBar: true
+    centerOnBar: !root.anchorItem // icon mode when we know the bar slot
     focusTarget: root.locked ? pass : search
     contentWidth: panel.fittedContentWidth(Style.space(root.locked ? 360 : 560))
     contentHeight: panel.fittedContentHeight(root.locked ? contentCol.implicitHeight : Style.space(420))
@@ -347,6 +349,7 @@ Panel {
         visible: root.locked
         password: true
         enabled: !root.busy
+        echoMode: root.revealPw ? TextInput.Normal : TextInput.Password
         placeholderText: "master password…"
         onTextChanged: passError.text = ""
 
@@ -364,6 +367,24 @@ Panel {
         Keys.onEscapePressed: root.close()
       }
 
+      Text {
+        id: revealLabel
+        visible: root.locked
+        text: root.revealPw ? "\uF06E  hide password" : "\uF06D  show password"
+        color: root.revealPw ? Color.accent : Color.muted
+        font.family: "JetBrainsMono Nerd Font"
+        font.pixelSize: Style.font.caption
+
+        MouseArea {
+          anchors.fill: parent
+          anchors.margins: -8
+          cursorShape: Qt.PointingHandCursor
+          onClicked: {
+            root.revealPw = !root.revealPw;
+            pass.forceActiveFocus();
+          }
+        }
+      }
       Text {
         id: passError
         width: parent.width
