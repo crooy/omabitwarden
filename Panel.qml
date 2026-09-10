@@ -326,13 +326,15 @@ Panel {
     centerOnBar: true
     focusTarget: root.locked ? pass : search
     contentWidth: panel.fittedContentWidth(Style.space(root.locked ? 360 : 560))
-    contentHeight: panel.fittedContentHeight(Style.space(root.locked ? 150 : 420))
+    contentHeight: panel.fittedContentHeight(root.locked ? contentCol.implicitHeight : Style.space(420))
 
     Column {
+      id: contentCol
       anchors.fill: parent
       spacing: Style.space(8)
 
       PanelSectionHeader {
+        id: title
         width: parent.width
         text: root.locked ? "VAULT LOCKED" : "BITWARDEN"
       }
@@ -450,7 +452,7 @@ Panel {
         id: list
         visible: !root.locked
         width: parent.width
-        height: parent.height - title.height - search.height - parent.spacing * 2
+        height: parent.height - title.height - search.height - parent.spacing * 3
         clip: true
         model: root.filtered
         currentIndex: 0
