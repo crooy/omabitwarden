@@ -325,8 +325,8 @@ Panel {
     // card centered on the bar axis, below it. No new window type invented.
     centerOnBar: true
     focusTarget: root.locked ? pass : search
-    contentWidth: panel.fittedContentWidth(Style.space(560))
-    contentHeight: panel.fittedContentHeight(Style.space(420))
+    contentWidth: panel.fittedContentWidth(Style.space(root.locked ? 360 : 560))
+    contentHeight: panel.fittedContentHeight(Style.space(root.locked ? 150 : 420))
 
     Column {
       anchors.fill: parent
