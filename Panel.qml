@@ -332,20 +332,19 @@ Panel {
       anchors.fill: parent
       spacing: Style.space(8)
 
-      Text {
-        id: title
-        text: "omarchy - bitwarden"
-        color: Color.accent
-        font.pixelSize: 13
-        font.weight: Font.DemiBold
-        font.letterSpacing: 1.5
+      PanelSectionHeader {
+        width: parent.width
+        text: root.locked ? "VAULT LOCKED" : "BITWARDEN"
       }
+
+      PanelSeparator {}
 
       TextField {
         id: pass
         width: parent.width
         visible: root.locked
         password: true
+        enabled: !root.busy
         placeholderText: "master password…"
         onTextChanged: passError.text = ""
 
@@ -369,7 +368,7 @@ Panel {
         visible: root.locked && text.length > 0
         text: ""
         color: root.busy ? Color.foreground : Color.urgent
-        font.pixelSize: 12
+        font.pixelSize: Style.font.caption
       }
 
       Rectangle {
@@ -400,11 +399,12 @@ Panel {
 
       Text {
         width: parent.width
-        visible: root.locked
-        text: "vault locked · enter unlocks · ctrl+g/ctrl+p generate · esc closes"
+        visible: root.locked && !root.busy
+        text: "enter unlocks   ·   ctrl+g / ctrl+p generate   ·   esc closes"
         color: Color.muted
-        font.pixelSize: 12
+        font.pixelSize: Style.font.caption
       }
+
 
       TextField {
         id: search
