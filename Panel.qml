@@ -71,17 +71,17 @@ Panel {
   onSettingsChanged: Qt.callLater(root.applyPlacement) // settings land after mount
   onLockedChanged: Qt.callLater(root.applyPlacement) // swap card between window hosts
 
-  // Single card instance (contentCol + lockSwitch + toast) re-parented
-  // between the KeyboardPanel host and the two window hosts: pwBody while
-  // locked, mainBody once unlocked. One instance keeps every id/function
-  // (pass, search, toast, genProc, ...) valid.
+  // Single card instance (contentCol incl. the header-row lock switch,
+  // plus the toast) re-parented between the KeyboardPanel host and the two
+  // window hosts: pwBody while locked, mainBody once unlocked. One
+  // instance keeps every id/function (pass, search, toast, genProc, ...)
+  // valid.
   function applyPlacement() {
     if (!root.popoutHolder) return; // captured at mount; settings may arrive first
     let target = root.popoutHolder;
     if (root.placement === "window") target = root.locked ? pwBody : mainBody;
     if (contentCol.parent === target) return;
-    contentCol.parent = target;
-    lockSwitch.parent = target;
+    contentCol.parent = target; // lockSwitch travels inside the card header
     toast.parent = target;
     if (root.opened) Qt.callLater(function () {
       (root.locked ? pass : search).forceActiveFocus();
@@ -446,10 +446,33 @@ Panel {
       anchors.fill: parent
       spacing: Style.space(8)
 
-      PanelSectionHeader {
-        id: title
+      Item {
+        id: headerRow
         width: parent.width
-        text: root.locked ? "VAULT LOCKED" : "BITWARDEN"
+        height: title.height
+
+        PanelSectionHeader {
+          id: title
+          width: parent.width
+          text: root.locked ? "VAULT LOCKED" : "BITWARDEN"
+        }
+
+        // Lock switch sits ON the header row (right-aligned, above the
+        // separator): as a host sibling it collided with the separator in
+        // window mode, where the card spans the full window body.
+        Text {
+          id: lockSwitch
+          visible: !root.locked
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.right: parent.right
+          text: "lock"
+          color: Color.muted
+          font.pixelSize: 12
+
+          TapHandler {
+            onTapped: root.lockVault(true)
+          }
+        }
       }
 
       PanelSeparator {}
@@ -584,7 +607,7 @@ Panel {
         id: list
         visible: !root.locked
         width: parent.width
-        height: parent.height - title.height - search.height - parent.spacing * 3
+        height: visible ? parent.height - title.height - search.height - parent.spacing * 3 : 0
         clip: true
         model: root.filtered
         currentIndex: 0
@@ -680,21 +703,6 @@ Panel {
     }
 
     Text {
-      id: lockSwitch
-      visible: !root.locked
-      anchors.top: parent.top
-      anchors.right: parent.right
-      anchors.margins: Style.space(14)
-      text: "lock"
-      color: Color.muted
-      font.pixelSize: 12
-
-      TapHandler {
-        onTapped: root.lockVault(true)
-      }
-    }
-
-    Text {
       id: toast
       anchors.bottom: parent.bottom
       anchors.right: parent.right
@@ -729,8 +737,8 @@ Panel {
       if (pwWin.visible && root.locked) pass.forceActiveFocus();
     })
 
-    // Inset host for the re-parented card so lockSwitch/toast (14px
-    // margins inside the inset area) keep the popout look.
+    // Inset host for the re-parented card so the toast (14px margins
+    // inside the inset area) keeps the popout look.
     Item {
       id: pwBody
       anchors.fill: parent

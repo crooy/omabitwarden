@@ -2,6 +2,13 @@
 
 Bitwarden vault panel as an Omarchy shell plugin (kind: bar-widget): a lock icon in the bar toggles the vault panel; the icon keeps the shell plugin loaded.
 
+## Screenshots
+
+| Locked — unlock dialog | Unlocked — vault |
+|------------------------|------------------|
+| ![Unlock dialog](docs/screenshot-locked.png) | ![Vault](docs/screenshot-unlocked.png) |
+
+
 ## Features
 
 - Unlock with the master password through the official `bw` CLI (`bw unlock --passwordenv`, master password never on argv).
