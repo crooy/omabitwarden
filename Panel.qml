@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
@@ -12,14 +13,27 @@ import "totp.js" as Totp
 // header, serve dies with the panel. Clipboard: wl-copy --sensitive via stdin,
 // 45s auto-clear guarded by wl-paste compare.
 //
-// Ported from the standalone shell (panel/shell.qml). The card used to be a
-// dead-center modal over a fullscreen PanelWindow; as a plugin popout it rides
-// the native KeyboardPanel mechanism instead, placed with centerOnBar: true —
-// centered under the bar, the closest native positioning to the old centered
-// card (no new window type invented). Outside-click dismissal and focus
-// priming come from KeyboardPanel; Esc/close and the Ctrl+G/Ctrl+P/Ctrl+L
-// shortcuts stay on the fields, so no PanelKeyCatcher — its Keys.BeforeItem
-// priority would steal the list-arrow keys from the search field.
+// Ported from the standalone shell (panel/shell.qml). Three placement modes
+// (bar-layout entry settings.placement, anything else normalizes to the
+// default "window"):
+//   "icon"     - popout card under the widget's bar icon (KeyboardPanel).
+//   "centered" - popout card centered on the bar axis (KeyboardPanel's
+//                centerOnBar): the standalone dead-center modal's closest
+//                native position.
+//   "window"   - (default) two real toplevels built with
+//                Quickshell.FloatingWindow (gallery precedent: children of
+//                the panel root). The locked card lives in a small
+//                temporary floating window ("omabitwarden", float + center
+//                via Hyprland rules, never pinned); the unlocked vault
+//                lives in its own larger window ("omabitwarden vault",
+//                float + center initially, SUPER+T un-floats it, own size
+//                and float state). Persistent while open - no outside-
+//                click dismissal, copy toasts don't close either; Esc
+//                closes, SUPER+W closes.
+// Popout modes take outside-click dismissal and focus priming from
+// KeyboardPanel; Esc/close and the Ctrl+G/Ctrl+P/Ctrl+L shortcuts stay on
+// the fields, so no PanelKeyCatcher - its Keys.BeforeItem priority would
+// steal the list-arrow keys from the search field.
 //
 // The standalone theme.name FileView watcher is dropped: qs.Commons.Color is
 // a shared singleton the shell host live-follows; the clock/audio panels
@@ -30,7 +44,12 @@ Panel {
 
   // Orphaned bw serve from a previous shell instance dies at plugin mount:
   // it holds the vault open without any key (see checkStaleServe).
-  Component.onCompleted: root.checkStaleServe()
+  Component.onCompleted: {
+    root.checkStaleServe();
+    root.popoutHolder = contentCol.parent; // KeyboardPanel host, captured before any reparenting
+    root.applyPlacement();
+    root.ensureHyprRules();
+  }
   ipcTarget: "omabitwarden"
   manageIpc: false // IpcHandler lives in BarWidget.qml
 
@@ -40,6 +59,58 @@ Panel {
   property var anchorItem: null
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
+  // ---- Placement modes ("icon" | "centered" | "window"; default window)
+  readonly property string placement: {
+    const p = String(root.setting("placement", "window"));
+    return (p === "icon" || p === "centered") ? p : "window";
+  }
+  readonly property real winInset: Style.spacing.popupPadding + Style.space(2)
+  property Item popoutHolder: null // KeyboardPanel content host, captured at mount
+  property bool hyprRulesApplied: false
+
+  onSettingsChanged: Qt.callLater(root.applyPlacement) // settings land after mount
+  onLockedChanged: Qt.callLater(root.applyPlacement) // swap card between window hosts
+
+  // Single card instance (contentCol + lockSwitch + toast) re-parented
+  // between the KeyboardPanel host and the two window hosts: pwBody while
+  // locked, mainBody once unlocked. One instance keeps every id/function
+  // (pass, search, toast, genProc, ...) valid.
+  function applyPlacement() {
+    if (!root.popoutHolder) return; // captured at mount; settings may arrive first
+    let target = root.popoutHolder;
+    if (root.placement === "window") target = root.locked ? pwBody : mainBody;
+    if (contentCol.parent === target) return;
+    contentCol.parent = target;
+    lockSwitch.parent = target;
+    toast.parent = target;
+    if (root.opened) Qt.callLater(function () {
+      (root.locked ? pass : search).forceActiveFocus();
+    });
+  }
+
+  // Live placement switch, persisted like the clock's persistSettings.
+  function setPlacement(mode) {
+    const p = (mode === "icon" || mode === "centered" || mode === "window") ? mode : "";
+    if (!p) return "";
+    var entry = { id: root.moduleName };
+    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing];
+    entry.placement = p;
+    root.settings = entry;
+    if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry;
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry);
+    return p;
+  }
+
+  // Floating/centered rules for both window-mode toplevels (no pin: the
+  // card stays a temporary floating thing; the vault window keeps its own
+  // float state), applied once per shell session; duplicate rule calls
+  // across restarts are harmless.
+  function ensureHyprRules() {
+    if (root.hyprRulesApplied) return;
+    root.hyprRulesApplied = true;
+    hyprRulesProc.running = true;
+  }
 
   // ---- Vault state (ported verbatim from the standalone shell)
   property bool locked: true
@@ -350,7 +421,7 @@ Panel {
 
     onTriggered: {
       toast.text = "";
-      if (root.toastCloses) root.close(); // close-on-copy
+      if (root.toastCloses && root.placement !== "window") root.close(); // close-on-copy; window mode stays open
       root.toastCloses = false;
     }
   }
@@ -360,11 +431,12 @@ Panel {
     anchorItem: root.anchorItem
     owner: root.barIdentity
     bar: root.bar
-    open: root.opened
-    // The standalone panel was a dead-center modal over a fullscreen
-    // PanelWindow; the popout equivalent is the kit's centerOnBar placement:
-    // card centered on the bar axis, below it. No new window type invented.
-    centerOnBar: !root.anchorItem // icon mode when we know the bar slot
+    open: root.opened && root.placement !== "window"
+    // Popout modes: "icon" = card under the widget's bar icon, "centered" =
+    // card centered on the bar axis (the standalone dead-center modal's
+    // closest native position). In "window" mode this host stays in the
+    // tree but dormant; the card re-parents into the FloatingWindow.
+    centerOnBar: root.placement === "centered" || !root.anchorItem
     focusTarget: root.locked ? pass : search
     contentWidth: panel.fittedContentWidth(Style.space(root.locked ? 360 : 560))
     contentHeight: panel.fittedContentHeight(root.locked ? contentCol.implicitHeight : Style.space(420))
@@ -631,5 +703,70 @@ Panel {
       color: Color.accent
       font.pixelSize: 13
     }
+  }
+
+  // Window-mode hosts (gallery precedent: children of the panel root).
+  // pwWin: the locked card - a small temporary floating thing (float +
+  // center rules, never pinned). mainWin: the unlocked vault - its own
+  // real window: separate title, own size, own float state; starts
+  // float+centered like the card, SUPER+T un-floats it for a tiled
+  // session. Neither is ever pinned.
+  FloatingWindow {
+    id: pwWin
+    visible: root.opened && root.placement === "window" && root.locked
+    title: "omabitwarden"
+    color: Color.popups.background
+    implicitWidth: Style.space(360) + 2 * root.winInset
+    implicitHeight: contentCol.implicitHeight + 2 * root.winInset
+
+    // Propagate only a real user close (SUPER+W killactive): during the
+    // locked<->unlocked swap the other window is already taking the card.
+    onClosed: Qt.callLater(function () {
+      if (!pwWin.visible && !mainWin.visible) root.close();
+    })
+
+    onVisibleChanged: Qt.callLater(function () {
+      if (pwWin.visible && root.locked) pass.forceActiveFocus();
+    })
+
+    // Inset host for the re-parented card so lockSwitch/toast (14px
+    // margins inside the inset area) keep the popout look.
+    Item {
+      id: pwBody
+      anchors.fill: parent
+      anchors.margins: root.winInset
+    }
+  }
+
+  FloatingWindow {
+    id: mainWin
+    visible: root.opened && root.placement === "window" && !root.locked
+    title: "omabitwarden vault"
+    color: Color.popups.background
+    implicitWidth: Style.space(560) + 2 * root.winInset
+    implicitHeight: Style.space(420) + 2 * root.winInset
+
+    onClosed: Qt.callLater(function () {
+      if (!pwWin.visible && !mainWin.visible) root.close();
+    })
+
+    onVisibleChanged: Qt.callLater(function () {
+      if (mainWin.visible && !root.locked) search.forceActiveFocus();
+    })
+
+    Item {
+      id: mainBody
+      anchors.fill: parent
+      anchors.margins: root.winInset
+    }
+  }
+
+  // The windowrules command run by ensureHyprRules(): Hyprland 0.56+ takes
+  // dynamic rules via hl.window_rule through hyprctl eval (legacy
+  // windowrulev2 keyword syntax is rejected there). Absent or older
+  // hyprctl the window still opens and simply spawns tiled.
+  Process {
+    id: hyprRulesProc
+    command: ["/bin/sh", "-c", "command -v hyprctl >/dev/null 2>&1 || exit 0; for spec in 'omabitwarden' 'omabitwarden vault'; do for r in float center; do hyprctl eval \"hl.window_rule({ match = { title = '$spec' }, $r = true })\" >/dev/null 2>&1; done; done"]
   }
 }

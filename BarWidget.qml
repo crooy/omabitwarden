@@ -91,6 +91,15 @@ BarWidget {
     function status(): string {
       return root.locked ? "locked" : "unlocked"
     }
+
+    function setPlacement(mode: string): string {
+      if (panelLoader.item && panelLoader.item.setPlacement(mode)) return "placement: " + mode
+      return "error: placement must be icon|centered|window"
+    }
+
+    function getPlacement(): string {
+      return panelLoader.item ? panelLoader.item.placement : "window"
+    }
   }
 
   BarIconButton {
