@@ -50,6 +50,7 @@ Panel {
   property int fieldSel: 1
   property var fieldNames: ["username", "password", "one-time key"]
   property int statusAttempts: 0
+  property int itemAttempts: 0 // /list/object/items retry counter after "unlocked"
   property bool toastCloses: false // only copy-toasts close the panel
   property bool busy: false // unlock in flight: bar + status message
   property bool revealPw: false // master password shown in cleartext
@@ -157,10 +158,13 @@ Panel {
     passError.text = "unlocking — deriving key…";
     unlockProc.environment = ({ BW_PANEL_PW: pw });
     showToast("unlocking…");
+    unlockWatchdog.restart();
     unlockProc.running = true;
   }
 
   function unlockFinished(exitCode, out) {
+    if (!root.busy) return; // abandoned attempt (lock or unlock watchdog)
+    unlockWatchdog.stop();
     const key = (out || "").trim();
     if (!/^[A-Za-z0-9+/=_-]{32,}$/.test(key)) {
       passError.text = "wrong master password — try again";
@@ -171,6 +175,7 @@ Panel {
     root.sessionKey = key;
     serveProc.environment = ({ BW_SESSION: key });
     root.statusAttempts = 0;
+    root.itemAttempts = 0;
     passError.text = "unlocking — starting vault…";
     serveProc.running = true;
     statusTimer.restart();
@@ -186,6 +191,7 @@ Panel {
       return;
     }
     root.api("/status", function (data) {
+      if (!root.busy) return; // stale poll from an abandoned attempt
       if (data && data.template && data.template.status === "unlocked") {
         statusTimer.stop();
         root.openVault();
@@ -196,9 +202,22 @@ Panel {
   function openVault() {
     root.api("/list/object/items", function (data, err) {
       if (err || !data || !data.data) {
-        showToast("item list failed: " + (err || "empty"));
+        // A cold bw serve can report "unlocked" before item queries are
+        // ready: retry briefly, then land on a clean state instead of a
+        // stuck busy card with the error toast already gone.
+        root.itemAttempts++;
+        if (root.itemAttempts > 120) {
+          itemRetryTimer.stop();
+          root.busy = false;
+          passError.text = "vault did not load — try again";
+          showToast("item list failed: " + (err || "empty"));
+          root.lockVault(false);
+          return;
+        }
+        itemRetryTimer.restart();
         return;
       }
+      itemRetryTimer.stop();
       root.items = data.data
         .filter(function (it) { return it.type === 1 && it.login; })
         .map(function (it) {
@@ -241,6 +260,8 @@ Panel {
     root.sessionKey = ""; // key gone with the serve child
     serveProc.running = false; // SIGTERM; managed child must never outlive the key
     portKillProc.running = true; // orphans (shell restarted under us) die by port
+    statusTimer.stop(); // a lock during unlock-in-flight must kill the poll
+    itemRetryTimer.stop();
     root.busy = false;
     if (hide) root.close();
     else { pass.clear(); pass.forceActiveFocus(); }
@@ -299,6 +320,23 @@ Panel {
     interval: 300
     repeat: true
     onTriggered: root.pollStatus()
+  }
+  Timer {
+    id: itemRetryTimer
+    interval: 500
+    repeat: false
+    onTriggered: root.openVault()
+  }
+  Timer {
+    id: unlockWatchdog
+    interval: 60000 // bw unlock (Argon2 KDF) is seconds-scale; a hung child is an error
+    onTriggered: {
+      if (!root.busy) return;
+      unlockProc.running = false; // kill a hung bw unlock; its late callback is guarded
+      root.busy = false;
+      passError.text = "unlock timed out — try again";
+      pass.forceActiveFocus();
+    }
   }
 
   Timer {
