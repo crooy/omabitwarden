@@ -44,3 +44,7 @@ Target `omabitwarden`:
 | `getPlacement` | Prints the current placement mode |
 
 Example: `omarchy-shell omabitwarden toggle`
+
+## License
+
+MIT — see [LICENSE](LICENSE).
