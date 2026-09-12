@@ -6,7 +6,7 @@ Bitwarden vault panel as an Omarchy shell plugin (kind: bar-widget): a lock icon
 
 | Locked — unlock dialog | Unlocked — vault |
 |------------------------|------------------|
-| ![Unlock dialog](docs/screenshot-locked.png) | ![Vault](docs/screenshot-unlocked.png) |
+| ![Unlock dialog](docs/locked.png) | ![Vault](docs/unlocked.png) |
 
 
 ## Features
