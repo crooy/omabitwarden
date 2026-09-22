@@ -5,13 +5,15 @@ import qs.Commons
 import qs.Ui
 import "totp.js" as Totp
 
-// omabitwarden: keyboard-first vault panel over `bw serve`.
-// Unlock: bw unlock --passwordenv BW_PANEL_PW --raw (master password via env,
-// never argv) -> session key memory-only -> managed bw serve child (BW_SESSION
-// env) -> GET /status poll -> one GET /list/object/items (full items: password,
-// totp seed included) -> everything else client-side. GET-only, no Origin
-// header, serve dies with the panel. Clipboard: wl-copy --sensitive via stdin,
-// 45s auto-clear guarded by wl-paste compare.
+// omabitwarden: keyboard-first vault panel. Unlock: bw unlock
+// --passwordenv BW_PANEL_PW --raw (master password via env, never argv;
+// an inherited desktop BW_SESSION is scrubbed) -> session key memory-only
+// -> ONE `bw list items` child (BW_SESSION env, full items: password +
+// totp seed included) -> everything else client-side. No serve daemon:
+// two bw calls per unlock never amortize one, and a loopback port
+// holding the vault open is the whole orphan/stale-serve failure class.
+// Clipboard: wl-copy --sensitive via stdin, 45s auto-clear guarded by
+// wl-paste compare.
 //
 // Ported from the standalone shell (panel/shell.qml). Three placement modes
 // (bar-layout entry settings.placement, anything else normalizes to the
@@ -43,9 +45,10 @@ Panel {
   moduleName: "crooy.omabitwarden"
 
   // Orphaned bw serve from a previous shell instance dies at plugin mount:
-  // it holds the vault open without any key (see checkStaleServe).
+  // it holds the vault open without any key (portKillProc sweep below).
   Component.onCompleted: {
-    root.checkStaleServe();
+    portKillProc.running = true; // orphaned serve from the old design (or foreign) dies by port
+    bwLocateProc.running = true; // PATH-lookup beats a hardcoded prefix
     root.popoutHolder = contentCol.parent; // KeyboardPanel host, captured before any reparenting
     root.applyPlacement();
     root.ensureHyprRules();
@@ -120,13 +123,11 @@ Panel {
   property int expandedIndex: -1
   property int fieldSel: 1
   property var fieldNames: ["username", "password", "one-time key"]
-  property int statusAttempts: 0
-  property int itemAttempts: 0 // /list/object/items retry counter after "unlocked"
+  property int listAttempts: 0 // one clean retry for `bw list items`, then a clean lock
+  property string bwPath: "/usr/bin/bw" // corrected at mount; this install's bw lives in ~/.local/bin
   property bool toastCloses: false // only copy-toasts close the panel
   property bool busy: false // unlock in flight: bar + status message
   property bool revealPw: false // master password shown in cleartext
-
-  readonly property string apiBase: "http://127.0.0.1:8087"
 
   readonly property var filtered: root.items.filter(function (it) {
     const q = root.query.toLowerCase();
@@ -143,7 +144,6 @@ Panel {
     if (root.locked) {
       pass.clear();
       passError.text = "";
-      root.checkStaleServe();
     }
     root.controller.show();
     idleTimer.restart();
@@ -162,19 +162,6 @@ Panel {
     toast.text = t;
     toastCloses = closes === true;
     toastTimer.restart();
-  }
-
-  function api(path, cb) {
-    const xhr = new XMLHttpRequest();
-    xhr.open("GET", root.apiBase + path);
-    xhr.onreadystatechange = function () {
-      if (xhr.readyState !== XMLHttpRequest.DONE) return;
-      let env = null;
-      try { env = JSON.parse(xhr.responseText); } catch (e) {}
-      if (xhr.status === 200 && env && env.success) cb(env.data, null);
-      else cb(null, (env && env.message) ? env.message : ("http " + xhr.status));
-    };
-    xhr.send();
   }
 
   // Copy: secret reaches wl-copy via stdin only. Auto-clear after 45s only
@@ -227,7 +214,7 @@ Panel {
     pass.text = "";
     root.busy = true;
     passError.text = "unlocking — deriving key…";
-    unlockProc.environment = ({ BW_PANEL_PW: pw });
+    unlockProc.environment = ({ BW_PANEL_PW: pw, BW_SESSION: null }); // null removes any inherited desktop session
     showToast("unlocking…");
     unlockWatchdog.restart();
     unlockProc.running = true;
@@ -237,6 +224,7 @@ Panel {
     if (!root.busy) return; // abandoned attempt (lock or unlock watchdog)
     unlockWatchdog.stop();
     const key = (out || "").trim();
+    console.log("omabitwarden: bw unlock exit=" + exitCode + " keylen=" + key.length);
     if (!/^[A-Za-z0-9+/=_-]{32,}$/.test(key)) {
       passError.text = "wrong master password — try again";
       pass.forceActiveFocus();
@@ -244,82 +232,53 @@ Panel {
       return;
     }
     root.sessionKey = key;
-    serveProc.environment = ({ BW_SESSION: key });
-    root.statusAttempts = 0;
-    root.itemAttempts = 0;
-    passError.text = "unlocking — starting vault…";
-    serveProc.running = true;
-    statusTimer.restart();
-  }
-
-  function pollStatus() {
-    root.statusAttempts++;
-    if (root.statusAttempts > 200) {
-      statusTimer.stop();
-      root.busy = false;
-      passError.text = "bw serve failed to start — try again";
-      showToast("bw serve did not come up on :8087");
-      return;
-    }
-    root.api("/status", function (data) {
-      if (!root.busy) return; // stale poll from an abandoned attempt
-      if (data && data.template && data.template.status === "unlocked") {
-        statusTimer.stop();
-        root.openVault();
-      }
-    }); // transport errors while starting: keep polling
+    root.listAttempts = 0;
+    passError.text = "unlocking — loading vault…";
+    root.openVault();
   }
 
   function openVault() {
-    root.api("/list/object/items", function (data, err) {
-      if (err || !data || !data.data) {
-        // A cold bw serve can report "unlocked" before item queries are
-        // ready: retry briefly, then land on a clean state instead of a
-        // stuck busy card with the error toast already gone.
-        root.itemAttempts++;
-        if (root.itemAttempts > 120) {
-          itemRetryTimer.stop();
-          root.busy = false;
-          passError.text = "vault did not load — try again";
-          showToast("item list failed: " + (err || "empty"));
-          root.lockVault(false);
-          return;
-        }
-        itemRetryTimer.restart();
-        return;
-      }
-      itemRetryTimer.stop();
-      root.items = data.data
-        .filter(function (it) { return it.type === 1 && it.login; })
-        .map(function (it) {
-          return {
-            id: it.id,
-            name: it.name || "(unnamed)",
-            username: it.login.username || "",
-            password: it.login.password || "",
-            totp: it.login.totp || ""
-          };
-        })
-        .sort(function (a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1; });
-      root.busy = false;
-      root.locked = false;
-      root.expandedIndex = -1;
-      root.query = "";
-      search.clear();
-      list.currentIndex = 0;
-      search.forceActiveFocus();
-    });
+    listProc.environment = ({ BW_SESSION: root.sessionKey });
+    listWatchdog.restart();
+    listProc.running = true;
   }
 
-  function checkStaleServe() {
-    // The panel owns :8087. Any bw serve answering while we are locked is
-    // stale (orphaned by a shell restart, or foreign) and still holds the
-    // vault open without any key — kill it, then show the unlock card.
-    root.api("/status", function (data, err) {
-      if (err) return; // port free -> normal unlock path
-      showToast("stale bw serve on :8087 killed — unlock to continue");
-      portKillProc.running = true;
-    });
+  function onListFinished(exitCode, out) {
+    if (!root.busy) return; // lock or watchdog landed first
+    listWatchdog.stop();
+    console.log("omabitwarden: bw list exit=" + exitCode + " len=" + (out || "").length);
+    if (exitCode !== 0) { root.listFailed("bw exited " + exitCode); return; }
+    let arr = null;
+    try { arr = JSON.parse(out); } catch (e) {}
+    if (!Array.isArray(arr)) { root.listFailed("unparsable item list (len " + (out || "").length + ")"); return; }
+    root.items = arr
+      .filter(function (it) { return it.type === 1 && it.login; })
+      .map(function (it) {
+        return {
+          id: it.id,
+          name: it.name || "(unnamed)",
+          username: it.login.username || "",
+          password: it.login.password || "",
+          totp: it.login.totp || ""
+        };
+      })
+      .sort(function (a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1; });
+    root.busy = false;
+    root.locked = false;
+    root.expandedIndex = -1;
+    root.query = "";
+    search.clear();
+    list.currentIndex = 0;
+    search.forceActiveFocus();
+  }
+
+  function listFailed(err) {
+    // One clean retry, then a clean locked state — never a stuck busy card.
+    root.listAttempts++;
+    if (root.listAttempts < 2) { listRetryTimer.restart(); return; }
+    passError.text = "vault did not load — unlock again";
+    showToast("item list failed: " + err);
+    root.lockVault(false);
   }
 
   function lockVault(hide) {
@@ -328,11 +287,10 @@ Panel {
     root.items = [];
     root.query = "";
     root.expandedIndex = -1;
-    root.sessionKey = ""; // key gone with the serve child
-    serveProc.running = false; // SIGTERM; managed child must never outlive the key
-    portKillProc.running = true; // orphans (shell restarted under us) die by port
-    statusTimer.stop(); // a lock during unlock-in-flight must kill the poll
-    itemRetryTimer.stop();
+    root.sessionKey = ""; // key lives only for the bw calls it serves
+    listProc.running = false; // SIGTERM; a dead session's answer is refused by !busy
+    listWatchdog.stop();
+    listRetryTimer.stop();
     root.busy = false;
     if (hide) root.close();
     else { pass.clear(); pass.forceActiveFocus(); }
@@ -348,29 +306,69 @@ Panel {
 
   Process {
     id: unlockProc
-    command: ["/usr/bin/bw", "unlock", "--passwordenv", "BW_PANEL_PW", "--raw"]
+    command: [root.bwPath, "unlock", "--passwordenv", "BW_PANEL_PW", "--raw"]
     stdout: StdioCollector {
-      onStreamFinished: root.unlockFinished(unlockProc.exitCode, text)
+      id: unlockStdout
+      waitForEnd: true
     }
     stderr: StdioCollector {
       onStreamFinished: console.log("bw unlock stderr: " + text)
     }
+    onExited: function (exitCode) {
+      root.unlockFinished(exitCode, unlockStdout.text);
+    }
   }
 
   Process {
-    id: serveProc
-    command: ["/usr/bin/bw", "serve", "--hostname", "127.0.0.1", "--port", "8087", "--disable-origin-protection"]
-    onExited: {
-      if (!root.locked) {
-        root.showToast("bw serve exited — locking");
-        root.lockVault(false);
+    id: listProc
+    command: [root.bwPath, "list", "items", "--nointeraction"]
+    // waitForEnd + onExited: stdout EOF can beat the recorded exit code,
+    // so onStreamFinished would race a stale 0 into onListFinished.
+    stdout: StdioCollector {
+      id: listStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      onStreamFinished: console.log("bw list stderr: " + text)
+    }
+    onExited: function (exitCode) {
+      root.onListFinished(exitCode, listStdout.text);
+    }
+  }
+
+  Timer {
+    id: listWatchdog
+    interval: 60000 // bw list is seconds-scale; a hung child must not hold the busy card
+    onTriggered: {
+      if (!root.busy) return;
+      listProc.running = false;
+      root.listFailed("timed out");
+    }
+  }
+
+  Timer {
+    id: listRetryTimer
+    interval: 1000
+    onTriggered: if (root.busy) root.openVault()
+  }
+
+
+  Process {
+    id: bwLocateProc
+    command: ["sh", "-c", "command -v bw || true"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        const p = text.trim();
+        if (p) root.bwPath = p;
+        else console.warn("omabitwarden: bw not found on PATH — unlock will fail");
       }
     }
   }
 
-
   Process {
     id: portKillProc
+    // Mount-time sweep only: with no serve of our own, anything on :8087 is
+    // an orphan from the old design (or foreign) and holds the vault open.
     // fuser (port match, not cmdline) so this never pkills its own shell.
     command: ["/bin/sh", "-c", "fuser -k 8087/tcp >/dev/null 2>&1 || true"]
   }
@@ -386,18 +384,6 @@ Panel {
     }
   }
 
-  Timer {
-    id: statusTimer
-    interval: 300
-    repeat: true
-    onTriggered: root.pollStatus()
-  }
-  Timer {
-    id: itemRetryTimer
-    interval: 500
-    repeat: false
-    onTriggered: root.openVault()
-  }
   Timer {
     id: unlockWatchdog
     interval: 60000 // bw unlock (Argon2 KDF) is seconds-scale; a hung child is an error
