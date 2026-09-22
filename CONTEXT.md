@@ -22,6 +22,10 @@ The Wayland clipboard. The user's word "pasteboard" means this. The app writes F
 
 Unlocking the Vault yields a bw session key (what `bw unlock --raw` prints). Holding a valid Session Key is the app's "unlocked" state; without one the app is "locked".
 
+## Vault session
+
+The app's Unlock state machine (`VaultSession.qml`): derives the Session Key from the master password, loads the Vault's login Items with one `bw list items` child, and exposes locked/unlocking/ready plus the Items. Owns no rendering; the panel is its only caller.
+
 ## Generator
 
 The bitwarden-style secret generator (length, character classes, passphrase mode) used to produce a new secret, independent of any existing Item.

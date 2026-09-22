@@ -4,7 +4,7 @@
   "name": "Bitwarden",
   "version": "1.0.0",
   "author": "Ronald Crooy",
-  "description": "Bitwarden vault: bar lock icon toggling a keyboard-first unlock/search/copy panel over bw serve",
+  "description": "Bitwarden vault: bar lock icon toggling a keyboard-first unlock/search/copy panel over the bw CLI",
   "kinds": [
     "bar-widget"
   ],

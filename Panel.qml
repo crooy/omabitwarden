@@ -15,6 +15,11 @@ import "totp.js" as Totp
 // Clipboard: wl-copy --sensitive via stdin, 45s auto-clear guarded by
 // wl-paste compare.
 //
+// Internal modules (this file is the view + card host): VaultSession.qml
+// owns the unlock state machine (bw resolution, session scrub, one
+// `bw list items` child, watchdogs); Clipboard.qml owns secret copy +
+// auto-clear; totp.js computes codes offline.
+//
 // Ported from the standalone shell (panel/shell.qml). Three placement modes
 // (bar-layout entry settings.placement, anything else normalizes to the
 // default "window"):
@@ -44,11 +49,8 @@ Panel {
   id: root
   moduleName: "crooy.omabitwarden"
 
-  // Orphaned bw serve from a previous shell instance dies at plugin mount:
-  // it holds the vault open without any key (portKillProc sweep below).
+  // Orphaned bw serve sweeps and bw resolution live in VaultSession.
   Component.onCompleted: {
-    portKillProc.running = true; // orphaned serve from the old design (or foreign) dies by port
-    bwLocateProc.running = true; // PATH-lookup beats a hardcoded prefix
     root.popoutHolder = contentCol.parent; // KeyboardPanel host, captured before any reparenting
     root.applyPlacement();
     root.ensureHyprRules();
@@ -74,11 +76,19 @@ Panel {
   onSettingsChanged: Qt.callLater(root.applyPlacement) // settings land after mount
   onLockedChanged: Qt.callLater(root.applyPlacement) // swap card between window hosts
 
-  // Single card instance (contentCol incl. the header-row lock switch,
-  // plus the toast) re-parented between the KeyboardPanel host and the two
-  // window hosts: pwBody while locked, mainBody once unlocked. One
-  // instance keeps every id/function (pass, search, toast, genProc, ...)
-  // valid.
+  // ---- Card hosting: "where does the card live" ---------------------------
+  //
+  // Contract (this is the whole interface of the hosting machinery):
+  // ONE card instance — contentCol incl. the header-row lock switch, plus
+  // the toast — exists for the panel's lifetime; hosting is re-parenting it
+  // between exactly three slots:
+  //   KeyboardPanel host  — icon/centered popout modes
+  //   pwBody              — window mode while locked
+  //   mainBody            — window mode once unlocked
+  // Because the instance never moves within a slot's lifetime, every
+  // id/function on the card (pass, search, list, toast, ...) stays valid
+  // and placement never recreates UI. A new placement mode = one more slot
+  // plus one branch in applyPlacement(); never a second card.
   function applyPlacement() {
     if (!root.popoutHolder) return; // captured at mount; settings may arrive first
     let target = root.popoutHolder;
@@ -115,18 +125,37 @@ Panel {
     hyprRulesProc.running = true;
   }
 
-  // ---- Vault state (ported verbatim from the standalone shell)
-  property bool locked: true
-  property string sessionKey: "" // memory only, never argv/URL/disk
-  property var items: []
+  // ---- Vault state: rendering mirrors VaultSession; the panel holds no
+  // pipeline state of its own.
+  VaultSession {
+    id: vault
+    onPhaseChanged: {
+      if (vault.phase === "ready") {
+        root.expandedIndex = -1;
+        root.query = "";
+        search.clear();
+        list.currentIndex = 0;
+        search.forceActiveFocus();
+      } else if (vault.phase === "locked") {
+        root.revealPw = false; // pipeline lock: next master password must not render in cleartext
+        pass.clear();
+        pass.forceActiveFocus();
+      }
+    }
+  }
+
+  Clipboard {
+    id: clipboard
+  }
+
+  readonly property bool locked: vault.phase !== "ready"
+  readonly property bool busy: vault.phase === "unlocking" // unlock in flight: bar + status message
+  property var items: vault.items
   property string query: ""
   property int expandedIndex: -1
   property int fieldSel: 1
   property var fieldNames: ["username", "password", "one-time key"]
-  property int listAttempts: 0 // one clean retry for `bw list items`, then a clean lock
-  property string bwPath: "/usr/bin/bw" // corrected at mount; this install's bw lives in ~/.local/bin
   property bool toastCloses: false // only copy-toasts close the panel
-  property bool busy: false // unlock in flight: bar + status message
   property bool revealPw: false // master password shown in cleartext
 
   readonly property var filtered: root.items.filter(function (it) {
@@ -143,7 +172,7 @@ Panel {
     list.currentIndex = 0;
     if (root.locked) {
       pass.clear();
-      passError.text = "";
+      vault.clearStatus(); // an old failure message must not greet the next attempt
     }
     root.controller.show();
     idleTimer.restart();
@@ -164,18 +193,8 @@ Panel {
     toastTimer.restart();
   }
 
-  // Copy: secret reaches wl-copy via stdin only. Auto-clear after 45s only
-  // if the clipboard still holds this exact secret (wl-paste --no-newline).
-  function copySecret(name, secret, field) {
-    copyProc.stdinEnabled = true;
-    copyProc.exec({ command: ["wl-copy", "--sensitive"] });
-    copyProc.write(secret);
-    copyProc.stdinEnabled = false; // EOF: wl-copy forks its serving child
-    clearProc.environment = ({ S: secret });
-    clearProc.exec(["/bin/sh", "-c", "sleep 45; [ \"$(wl-paste --no-newline)\" = \"$S\" ] && exec wl-copy --clear"]);
-    showToast("copied \u2713 " + name + (field ? " \u00b7 " + field : ""), true);
-  }
-
+  // Copy a Field: the secret-handling dance lives in Clipboard; the panel
+  // derives the value and toasts.
   function copyField(name) {
     const it = root.filtered[list.currentIndex];
     if (!it) return;
@@ -188,7 +207,8 @@ Panel {
       showToast("no " + label + " on " + name);
       return;
     }
-    root.copySecret(name, secret, label);
+    clipboard.copy(secret);
+    showToast("copied ✓ " + name + " · " + label, true);
   }
 
   function expandOrCopy() {
@@ -212,166 +232,19 @@ Panel {
     root.revealPw = false;
     const pw = pass.text;
     pass.text = "";
-    root.busy = true;
-    passError.text = "unlocking — deriving key…";
-    unlockProc.environment = ({ BW_PANEL_PW: pw, BW_SESSION: null }); // null removes any inherited desktop session
     showToast("unlocking…");
-    unlockWatchdog.restart();
-    unlockProc.running = true;
-  }
-
-  function unlockFinished(exitCode, out) {
-    if (!root.busy) return; // abandoned attempt (lock or unlock watchdog)
-    unlockWatchdog.stop();
-    const key = (out || "").trim();
-    console.log("omabitwarden: bw unlock exit=" + exitCode + " keylen=" + key.length);
-    if (!/^[A-Za-z0-9+/=_-]{32,}$/.test(key)) {
-      passError.text = "wrong master password — try again";
-      pass.forceActiveFocus();
-      root.busy = false;
-      return;
-    }
-    root.sessionKey = key;
-    root.listAttempts = 0;
-    passError.text = "unlocking — loading vault…";
-    root.openVault();
-  }
-
-  function openVault() {
-    listProc.environment = ({ BW_SESSION: root.sessionKey });
-    listWatchdog.restart();
-    listProc.running = true;
-  }
-
-  function onListFinished(exitCode, out) {
-    if (!root.busy) return; // lock or watchdog landed first
-    listWatchdog.stop();
-    console.log("omabitwarden: bw list exit=" + exitCode + " len=" + (out || "").length);
-    if (exitCode !== 0) { root.listFailed("bw exited " + exitCode); return; }
-    let arr = null;
-    try { arr = JSON.parse(out); } catch (e) {}
-    if (!Array.isArray(arr)) { root.listFailed("unparsable item list (len " + (out || "").length + ")"); return; }
-    root.items = arr
-      .filter(function (it) { return it.type === 1 && it.login; })
-      .map(function (it) {
-        return {
-          id: it.id,
-          name: it.name || "(unnamed)",
-          username: it.login.username || "",
-          password: it.login.password || "",
-          totp: it.login.totp || ""
-        };
-      })
-      .sort(function (a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1; });
-    root.busy = false;
-    root.locked = false;
-    root.expandedIndex = -1;
-    root.query = "";
-    search.clear();
-    list.currentIndex = 0;
-    search.forceActiveFocus();
-  }
-
-  function listFailed(err) {
-    // One clean retry, then a clean locked state — never a stuck busy card.
-    root.listAttempts++;
-    if (root.listAttempts < 2) { listRetryTimer.restart(); return; }
-    passError.text = "vault did not load — unlock again";
-    showToast("item list failed: " + err);
-    root.lockVault(false);
+    vault.unlock(pw);
   }
 
   function lockVault(hide) {
-    root.locked = true;
+    vault.lock();
     root.revealPw = false;
-    root.items = [];
     root.query = "";
     root.expandedIndex = -1;
-    root.sessionKey = ""; // key lives only for the bw calls it serves
-    listProc.running = false; // SIGTERM; a dead session's answer is refused by !busy
-    listWatchdog.stop();
-    listRetryTimer.stop();
-    root.busy = false;
     if (hide) root.close();
     else { pass.clear(); pass.forceActiveFocus(); }
   }
 
-  Process {
-    id: copyProc
-  }
-
-  Process {
-    id: clearProc
-  }
-
-  Process {
-    id: unlockProc
-    command: [root.bwPath, "unlock", "--passwordenv", "BW_PANEL_PW", "--raw"]
-    stdout: StdioCollector {
-      id: unlockStdout
-      waitForEnd: true
-    }
-    stderr: StdioCollector {
-      onStreamFinished: console.log("bw unlock stderr: " + text)
-    }
-    onExited: function (exitCode) {
-      root.unlockFinished(exitCode, unlockStdout.text);
-    }
-  }
-
-  Process {
-    id: listProc
-    command: [root.bwPath, "list", "items", "--nointeraction"]
-    // waitForEnd + onExited: stdout EOF can beat the recorded exit code,
-    // so onStreamFinished would race a stale 0 into onListFinished.
-    stdout: StdioCollector {
-      id: listStdout
-      waitForEnd: true
-    }
-    stderr: StdioCollector {
-      onStreamFinished: console.log("bw list stderr: " + text)
-    }
-    onExited: function (exitCode) {
-      root.onListFinished(exitCode, listStdout.text);
-    }
-  }
-
-  Timer {
-    id: listWatchdog
-    interval: 60000 // bw list is seconds-scale; a hung child must not hold the busy card
-    onTriggered: {
-      if (!root.busy) return;
-      listProc.running = false;
-      root.listFailed("timed out");
-    }
-  }
-
-  Timer {
-    id: listRetryTimer
-    interval: 1000
-    onTriggered: if (root.busy) root.openVault()
-  }
-
-
-  Process {
-    id: bwLocateProc
-    command: ["sh", "-c", "command -v bw || true"]
-    stdout: StdioCollector {
-      onStreamFinished: {
-        const p = text.trim();
-        if (p) root.bwPath = p;
-        else console.warn("omabitwarden: bw not found on PATH — unlock will fail");
-      }
-    }
-  }
-
-  Process {
-    id: portKillProc
-    // Mount-time sweep only: with no serve of our own, anything on :8087 is
-    // an orphan from the old design (or foreign) and holds the vault open.
-    // fuser (port match, not cmdline) so this never pkills its own shell.
-    command: ["/bin/sh", "-c", "fuser -k 8087/tcp >/dev/null 2>&1 || true"]
-  }
   Process {
     id: genProc
     command: ["/bin/sh", "-c", "tr -dc \"$A\" < /dev/urandom | head -c \"$N\""]
@@ -379,20 +252,11 @@ Panel {
       onStreamFinished: {
         const label = genProc.environment.N === "10" ? "generated phrase" : "generated password";
         const secret = text.trim();
-        if (secret.length > 0) root.copySecret(label, secret, "");
+        if (secret.length > 0) {
+          clipboard.copy(secret);
+          root.showToast("copied \u2713 " + label, true);
+        }
       }
-    }
-  }
-
-  Timer {
-    id: unlockWatchdog
-    interval: 60000 // bw unlock (Argon2 KDF) is seconds-scale; a hung child is an error
-    onTriggered: {
-      if (!root.busy) return;
-      unlockProc.running = false; // kill a hung bw unlock; its late callback is guarded
-      root.busy = false;
-      passError.text = "unlock timed out — try again";
-      pass.forceActiveFocus();
     }
   }
 
@@ -471,7 +335,6 @@ Panel {
         enabled: !root.busy
         echoMode: root.revealPw ? TextInput.Normal : TextInput.Password
         placeholderText: "master password…"
-        onTextChanged: passError.text = ""
 
         Keys.onPressed: (event) => {
           if ((event.key === Qt.Key_G) && (event.modifiers & Qt.ControlModifier)) {
@@ -509,7 +372,7 @@ Panel {
         id: passError
         width: parent.width
         visible: root.locked && text.length > 0
-        text: ""
+        text: vault.statusText
         color: root.busy ? Color.foreground : Color.urgent
         font.pixelSize: Style.font.caption
       }
