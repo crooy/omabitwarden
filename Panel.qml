@@ -129,6 +129,14 @@ Panel {
   // pipeline state of its own.
   VaultSession {
     id: vault
+    property bool _prevSyncing: false
+    onSyncingChanged: {
+      if (_prevSyncing && !vault.syncing) {
+        if (vault.syncFailed) root.showToast("vault sync failed");
+        else root.showToast("vault synced \u2713");
+      }
+      _prevSyncing = vault.syncing;
+    }
     onPhaseChanged: {
       if (vault.phase === "ready") {
         root.expandedIndex = -1;
@@ -310,6 +318,18 @@ Panel {
         // Lock switch sits ON the header row (right-aligned, above the
         // separator): as a host sibling it collided with the separator in
         // window mode, where the card spans the full window body.
+        // Subtle sync indicator: quiet caption beside the lock switch —
+        // never a modal, never stealing focus. Outcome lands in the toast.
+        Text {
+          visible: vault.syncing
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.right: lockSwitch.left
+          anchors.rightMargin: 14
+          text: "syncing…"
+          color: Color.muted
+          font.pixelSize: 12
+        }
+
         Text {
           id: lockSwitch
           visible: !root.locked
@@ -416,13 +436,16 @@ Panel {
         id: search
         visible: !root.locked
         width: parent.width
-        placeholderText: "search items…  ·  ctrl+l locks · ctrl+g/ctrl+p generate"
+        placeholderText: "search items…  ·  ctrl+r sync · ctrl+l locks · ctrl+g/ctrl+p generate"
 
         onTextChanged: root.query = text
 
         Keys.onPressed: (event) => {
           idleTimer.restart();
-          if ((event.key === Qt.Key_L) && (event.modifiers & Qt.ControlModifier)) {
+          if ((event.key === Qt.Key_R) && (event.modifiers & Qt.ControlModifier)) {
+            vault.sync();
+            event.accepted = true;
+          } else if ((event.key === Qt.Key_L) && (event.modifiers & Qt.ControlModifier)) {
             root.lockVault(true);
             event.accepted = true;
           } else if ((event.key === Qt.Key_G) && (event.modifiers & Qt.ControlModifier)) {

@@ -11,15 +11,20 @@ import Quickshell.Io
 //   lock()            — drop key + Items, kill children
 //   clearStatus()     — panel calls this on reopen so an old failure
 //                       message does not greet the next attempt
+//   sync()            — ready only: `bw sync`, then re-list Items; watch
+//                       `syncing`/`syncFailed` (stale Items survive a
+//                       failed refresh — the vault never locks on sync)
 //   items             — login Items: {id, name, username, password, totp}
 //   statusText        — stage message or last failure ("" when none)
+//   phase             — "locked" | "unlocking" | "ready"
 //
 // Implementation (all hidden from the panel):
 // - bw is resolved on PATH at mount (~/.local/bin here), never hardcoded.
 // - an inherited desktop BW_SESSION is scrubbed (null removes it) before
 //   `bw unlock`; secrets travel via env/stdin, never argv.
 // - a failed item load retries once, then lands on a clean locked state;
-//   a hung child never holds "unlocking" past its watchdog.
+//   a hung child never holds "unlocking" past its watchdog, and the
+//   watchdog's own SIGTERM completion is swallowed, not counted as failure.
 Item {
   id: root
 
@@ -28,6 +33,10 @@ Item {
   property string statusText: ""
   property int listAttempts: 0
   property bool listKilled: false // our own watchdog SIGTERM's exited(15) is not a failure
+  property bool listBusy: false // a list child is in flight (unlock load or sync refresh)
+  property bool listIsRefresh: false // refresh failures keep the vault open with stale Items
+  property bool syncing: false
+  property bool syncFailed: false
   property bool bwFound: false
   property string sessionKey: "" // memory only, never argv/URL/disk
   property string bwPath: "/usr/bin/bw" // corrected at mount; this install's bw lives in ~/.local/bin
@@ -59,11 +68,23 @@ Item {
     root.phase = "locked";
     root.items = [];
     root.sessionKey = ""; // key lives only for the bw calls it serves
+    root.syncing = false;
+    root.listBusy = false;
     unlockProc.running = false; // a stale completion must never be consumed by the next attempt
-    listProc.running = false; // SIGTERM; a dead session's answer is refused by the phase guard
+    syncProc.running = false;
+    listProc.running = false; // SIGTERM; a dead session's answer is refused by the busy guard
     listWatchdog.stop();
     listRetryTimer.stop();
+    syncWatchdog.stop();
     root.statusText = "";
+  }
+
+  function sync() {
+    if (root.phase !== "ready" || root.syncing || root.listBusy) return;
+    root.syncing = true;
+    root.syncFailed = false;
+    syncWatchdog.restart();
+    syncProc.running = true;
   }
 
   function unlockFinished(exitCode, out) {
@@ -79,10 +100,12 @@ Item {
     root.sessionKey = key;
     root.listAttempts = 0;
     root.statusText = "unlocking — loading vault…";
-    openVault();
+    root.openVault();
   }
 
   function openVault() {
+    root.listBusy = true;
+    root.listIsRefresh = false;
     listProc.environment = ({ BW_SESSION: root.sessionKey });
     listWatchdog.restart();
     listProc.running = true;
@@ -90,13 +113,13 @@ Item {
 
   function onListFinished(exitCode, out) {
     if (root.listKilled) { root.listKilled = false; return; } // our watchdog SIGTERM's exited(15)
-    if (root.phase !== "unlocking") return; // lock landed first
+    if (!root.listBusy) return; // stale answer: lock landed, child killed, or nobody waiting
     listWatchdog.stop();
     console.log("omabitwarden: bw list exit=" + exitCode + " len=" + (out || "").length);
-    if (exitCode !== 0) { listFailed("bw exited " + exitCode); return; }
+    if (exitCode !== 0) { root.listFailed("bw exited " + exitCode); return; }
     let arr = null;
     try { arr = JSON.parse(out); } catch (e) {}
-    if (!Array.isArray(arr)) { listFailed("unparsable item list (len " + (out || "").length + ")"); return; }
+    if (!Array.isArray(arr)) { root.listFailed("unparsable item list (len " + (out || "").length + ")"); return; }
     root.items = arr
       .filter(function (it) { return it.type === 1 && it.login; })
       .map(function (it) {
@@ -109,12 +132,28 @@ Item {
         };
       })
       .sort(function (a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1; });
+    root.listBusy = false;
+    if (root.listIsRefresh) {
+      root.listIsRefresh = false; // phase stays "ready": the panel keeps its list position
+      root.syncing = false; // the sync run ends here; syncFailed stays false
+      return;
+    }
     root.statusText = "";
     root.phase = "ready";
   }
 
   function listFailed(err) {
-    // One clean retry, then a clean locked state — never a stuck busy card.
+    // Refresh: fail soft — keep the vault open with the stale Items.
+    if (root.listIsRefresh) {
+      root.listBusy = false;
+      root.listIsRefresh = false;
+      root.syncFailed = true; // set BEFORE syncing=false: syncingChanged observers must see settled state
+      root.syncing = false;
+      console.warn("omabitwarden: vault sync failed: " + err);
+      return;
+    }
+    // Unlock load: one clean retry, then a clean locked state — never a
+    // stuck busy card.
     root.listAttempts++;
     if (root.listAttempts < 2) { listRetryTimer.restart(); return; }
     lock(); // clears statusText; the failure message is set after
@@ -160,6 +199,28 @@ Item {
   }
 
   Process {
+    id: syncProc
+    command: [root.bwPath, "sync", "--nointeraction"]
+    environment: ({ BW_SESSION: root.sessionKey })
+    stderr: StdioCollector {
+      onStreamFinished: console.log("bw sync stderr: " + text)
+    }
+    onExited: function (exitCode) {
+      console.log("omabitwarden: bw sync exit=" + exitCode);
+      if (!root.syncing) return; // lock or watchdog landed first
+      syncWatchdog.stop();
+      if (exitCode !== 0) {
+        root.syncFailed = true; // set BEFORE syncing=false: syncingChanged observers must see consistent state
+        root.syncing = false;
+        return;
+      }
+      root.listAttempts = 0; // fresh ladder for the post-sync re-list
+      root.openVault();
+      root.listIsRefresh = true; // openVault clears it; set after
+    }
+  }
+
+  Process {
     id: listProc
     command: [root.bwPath, "list", "items", "--nointeraction"]
     stdout: StdioCollector {
@@ -178,17 +239,29 @@ Item {
     id: listWatchdog
     interval: root.listTimeoutMs
     onTriggered: {
-      if (root.phase !== "unlocking") return;
+      console.log("omabitwarden: bw list watchdog fired (busy=" + root.listBusy + ")");
+      if (!root.listBusy) return;
       root.listKilled = true; // the SIGTERM below still fires onExited(15) — swallow it
       listProc.running = false;
-      listFailed("timed out");
+      root.listFailed("timed out");
     }
   }
 
   Timer {
     id: listRetryTimer
     interval: 1000
-    onTriggered: if (root.phase === "unlocking") root.openVault()
+    onTriggered: if (root.listBusy) root.openVault()
+  }
+
+  Timer {
+    id: syncWatchdog
+    interval: 120000 // bw sync hits the network; twice the list budget
+    onTriggered: {
+      if (!root.syncing) return;
+      syncProc.running = false;
+      root.syncFailed = true; // set BEFORE syncing=false: same observer-ordering rule as the exit path
+      root.syncing = false;
+    }
   }
 
   Timer {
